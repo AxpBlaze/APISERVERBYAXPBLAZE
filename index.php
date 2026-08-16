@@ -565,6 +565,76 @@ if (isset($_GET['api'])) {
         exit;
     }
 
+
+    /* -------------------------
+       Phone Lookup
+       Example:
+       /?api=1&action=phone_lookup&key=YOUR_KEY&phone=9876543210
+
+       This endpoint validates the number format and records usage.
+       It does not expose private personal information.
+    ------------------------- */
+
+    if ((string)($_GET['action'] ?? '') === 'phone_lookup') {
+
+        if ((string)$row['key_type'] !== 'PhoneLookup') {
+            http_response_code(403);
+
+            echo json_encode([
+                'success' => false,
+                'error' => 'This API key is not a PhoneLookup key.'
+            ], JSON_PRETTY_PRINT);
+            exit;
+        }
+
+        $phone = preg_replace(
+            '/\D+/',
+            '',
+            (string)($_GET['phone'] ?? '')
+        );
+
+        if ($phone === '' || strlen($phone) !== 10) {
+            http_response_code(400);
+
+            echo json_encode([
+                'success' => false,
+                'error' => 'A valid 10 digit mobile number is required.'
+            ], JSON_PRETTY_PRINT);
+            exit;
+        }
+
+        $now = date('Y-m-d H:i:s');
+
+        $q = $db->prepare("
+            UPDATE api_keys
+            SET requests=requests+1,last_used=?
+            WHERE id=?
+        ");
+        $q->execute([
+            $now,
+            (int)$row['id']
+        ]);
+
+        log_event(
+            (int)$row['user_id'],
+            $key,
+            'PHONE_LOOKUP'
+        );
+
+        echo json_encode([
+            'success' => true,
+            'action' => 'phone_lookup',
+            'phone' => $phone,
+            'valid_format' => true,
+            'key_type' => $row['key_type'],
+            'database_slot' => type_slot_name((string)$row['key_type']),
+            'expires_at' => $row['expires_at'],
+            'message' => 'Mobile number format is valid.'
+        ], JSON_PRETTY_PRINT);
+
+        exit;
+    }
+
     $q = $db->prepare("
         UPDATE api_keys
         SET requests=requests+1,last_used=?
