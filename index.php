@@ -66,6 +66,24 @@ CREATE TABLE IF NOT EXISTS channels (
     name TEXT NOT NULL,
     url TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id INTEGER NOT NULL,
+    project_name TEXT NOT NULL,
+    project_type TEXT NOT NULL,
+    user_hash TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    UNIQUE(key_id, project_name, project_type, user_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_activity_key
+ON project_activity(key_id);
+
+CREATE INDEX IF NOT EXISTS idx_project_activity_last_seen
+ON project_activity(last_seen);
 ");
 
 $defaults = [
@@ -179,6 +197,164 @@ function active_key_count(int $userId): int {
     ");
     $q->execute([$userId]);
     return (int)$q->fetchColumn();
+}
+
+
+/* -------------------------
+   Project / type analytics
+------------------------- */
+
+function type_slot_name(string $keyType): string {
+    $map = [
+        'Python'      => 'PythonDateBase',
+        'PHP'         => 'PHPDateBase',
+        'HTML'        => 'HTMLDateBase',
+        'PhoneLookup' => 'PhoneLookupDateBase',
+        'Database'    => 'DatabaseDateBase',
+        'Custom'      => 'CustomDateBase',
+    ];
+    return $map[$keyType] ?? (preg_replace('/[^A-Za-z0-9]/', '', $keyType) . 'DateBase');
+}
+
+function clean_project_value(string $value, int $max = 80): string {
+    $value = trim($value);
+    $value = preg_replace('/[^\pL\pN ._:@\/-]/u', '', $value) ?? '';
+    return substr($value !== '' ? $value : 'Unknown', 0, $max);
+}
+
+function record_project_heartbeat(string $apiKey, string $project, string $projectType, string $userId): array {
+    global $db;
+
+    $q = $db->prepare("
+        SELECT api_keys.*, users.username, users.banned
+        FROM api_keys
+        JOIN users ON users.id=api_keys.user_id
+        WHERE api_keys.api_key=?
+    ");
+    $q->execute([$apiKey]);
+    $row = $q->fetch();
+
+    if (
+        !$row ||
+        (int)$row['banned'] === 1 ||
+        (int)$row['active'] !== 1 ||
+        strtotime((string)$row['expires_at']) <= time()
+    ) {
+        return ['ok' => false, 'error' => 'Invalid, disabled or expired API key.'];
+    }
+
+    $project = clean_project_value($project);
+    $projectType = clean_project_value($projectType);
+    $userId = clean_project_value($userId);
+
+    /*
+     * Store a one-way identifier rather than the raw user identifier.
+     * This lets the dashboard count unique users without storing the
+     * supplied identifier itself.
+     */
+    $userHash = hash_hmac('sha256', $userId, (string)$apiKey);
+    $now = date('Y-m-d H:i:s');
+
+    $q = $db->prepare("
+        INSERT INTO project_activity
+            (key_id,project_name,project_type,user_hash,requests,first_seen,last_seen)
+        VALUES(?,?,?,?,1,?,?)
+        ON CONFLICT(key_id,project_name,project_type,user_hash)
+        DO UPDATE SET
+            requests=project_activity.requests+1,
+            last_seen=excluded.last_seen
+    ");
+    $q->execute([
+        (int)$row['id'],
+        $project,
+        $projectType,
+        $userHash,
+        $now,
+        $now
+    ]);
+
+    $q = $db->prepare("
+        UPDATE api_keys
+        SET requests=requests+1,last_used=?
+        WHERE id=?
+    ");
+    $q->execute([$now, (int)$row['id']]);
+
+    log_event((int)$row['user_id'], $apiKey, 'PROJECT_HEARTBEAT');
+
+    return [
+        'ok' => true,
+        'key_type' => (string)$row['key_type'],
+        'slot' => type_slot_name((string)$row['key_type']),
+        'project' => $project,
+        'project_type' => $projectType,
+        'expires_at' => (string)$row['expires_at']
+    ];
+}
+
+function project_stats_for_admin(): array {
+    global $db;
+
+    $q = $db->query("
+        SELECT
+            pa.*,
+            ak.api_key,
+            ak.key_type,
+            u.username
+        FROM project_activity pa
+        JOIN api_keys ak ON ak.id=pa.key_id
+        JOIN users u ON u.id=ak.user_id
+        ORDER BY pa.last_seen DESC
+    ");
+
+    $slots = [];
+    $now = time();
+
+    while ($row = $q->fetch()) {
+        $slot = type_slot_name((string)$row['key_type']);
+
+        if (!isset($slots[$slot])) {
+            $slots[$slot] = [
+                'key_type' => (string)$row['key_type'],
+                'projects' => [],
+                'requests' => 0,
+                'users' => []
+            ];
+        }
+
+        $projectKey = (string)$row['project_name'];
+        if (!isset($slots[$slot]['projects'][$projectKey])) {
+            $slots[$slot]['projects'][$projectKey] = [
+                'project_type' => (string)$row['project_type'],
+                'requests' => 0,
+                'users' => [],
+                'live_users' => 0,
+                'last_seen' => null
+            ];
+        }
+
+        $p =& $slots[$slot]['projects'][$projectKey];
+        $p['requests'] += (int)$row['requests'];
+        $p['users'][(string)$row['user_hash']] = true;
+
+        $lastTs = strtotime((string)$row['last_seen']) ?: 0;
+        if ($lastTs >= $now - 90) {
+            $p['live_users']++;
+        }
+
+        if (
+            $p['last_seen'] === null ||
+            strtotime((string)$p['last_seen']) < $lastTs
+        ) {
+            $p['last_seen'] = (string)$row['last_seen'];
+        }
+
+        $slots[$slot]['requests'] += (int)$row['requests'];
+        $slots[$slot]['users'][(string)$row['user_hash']] = true;
+        unset($p);
+    }
+
+    return $slots;
 }
 
 /* -------------------------
@@ -309,12 +485,21 @@ if ($me && isset($_POST['delete_own_key'])) {
 }
 
 /* -------------------------
-   Public API key tester
-   /?api=1&key=YOUR_KEY
+   Public API key tester / project heartbeat
+   Test: /?api=1&key=YOUR_KEY
+   Heartbeat:
+   /?api=1&action=heartbeat&key=YOUR_KEY&project=MySite&project_type=website&user=USER_ID
 ------------------------- */
 
 if (isset($_GET['api'])) {
     header('Content-Type: application/json; charset=utf-8');
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Methods: GET, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type');
+
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
+        exit;
+    }
 
     $key = trim((string)($_GET['key'] ?? ''));
 
@@ -322,6 +507,35 @@ if (isset($_GET['api'])) {
         echo json_encode([
             'success' => false,
             'error' => 'API key required.'
+        ], JSON_PRETTY_PRINT);
+        exit;
+    }
+
+    if ((string)($_GET['action'] ?? '') === 'heartbeat') {
+        $result = record_project_heartbeat(
+            $key,
+            (string)($_GET['project'] ?? 'Unknown Project'),
+            (string)($_GET['project_type'] ?? 'website'),
+            (string)($_GET['user'] ?? 'anonymous')
+        );
+
+        if (!$result['ok']) {
+            http_response_code(401);
+            echo json_encode([
+                'success' => false,
+                'error' => $result['error']
+            ], JSON_PRETTY_PRINT);
+            exit;
+        }
+
+        echo json_encode([
+            'success' => true,
+            'message' => 'Heartbeat recorded.',
+            'key_type' => $result['key_type'],
+            'database_slot' => $result['slot'],
+            'project' => $result['project'],
+            'project_type' => $result['project_type'],
+            'expires_at' => $result['expires_at']
         ], JSON_PRETTY_PRINT);
         exit;
     }
@@ -362,6 +576,7 @@ if (isset($_GET['api'])) {
         'success' => true,
         'message' => 'API key is valid.',
         'key_type' => $row['key_type'],
+        'database_slot' => type_slot_name((string)$row['key_type']),
         'username' => $row['username'],
         'expires_at' => $row['expires_at'],
         'requests' => (int)$row['requests'] + 1
@@ -374,6 +589,130 @@ if (isset($_GET['api'])) {
 ------------------------- */
 
 if (is_admin()) {
+
+    /* Website updater: authenticated admin + CSRF + PHP lint + backup + atomic install */
+    if (isset($_POST['action']) && $_POST['action'] === 'website_update_upload') {
+        check_csrf();
+
+        if (
+            !isset($_FILES['website_update_file']) ||
+            !is_array($_FILES['website_update_file'])
+        ) {
+            $error = 'Please select an index.php file.';
+        } elseif ((int)$_FILES['website_update_file']['error'] !== UPLOAD_ERR_OK) {
+            $error = 'Upload failed. Error code: ' . (int)$_FILES['website_update_file']['error'];
+        } elseif ((int)$_FILES['website_update_file']['size'] > 2 * 1024 * 1024) {
+            $error = 'Update file is too large. Maximum size is 2 MB.';
+        } else {
+            $tmp = (string)$_FILES['website_update_file']['tmp_name'];
+            $original = (string)$_FILES['website_update_file']['name'];
+
+            if (strtolower(pathinfo($original, PATHINFO_EXTENSION)) !== 'php') {
+                $error = 'Only a PHP index.php file is allowed.';
+            } elseif (!is_uploaded_file($tmp)) {
+                $error = 'Invalid uploaded file.';
+            } else {
+                $contents = @file_get_contents($tmp);
+
+                if ($contents === false || !preg_match('/^\s*<\?php\b/i', $contents)) {
+                    $error = 'The uploaded file must start with a PHP opening tag.';
+                } else {
+                    $backupDir = __DIR__ . DIRECTORY_SEPARATOR . 'backups';
+
+                    if (!is_dir($backupDir)) {
+                        @mkdir($backupDir, 0755, true);
+                    }
+
+                    $lintTmp = $backupDir . DIRECTORY_SEPARATOR . '.update_check_' . bin2hex(random_bytes(8)) . '.php';
+                    $newTmp = $backupDir . DIRECTORY_SEPARATOR . '.new_index_' . bin2hex(random_bytes(8)) . '.php';
+
+                    if (@file_put_contents($lintTmp, $contents, LOCK_EX) === false) {
+                        $error = 'Could not prepare the update file.';
+                    } else {
+                        $phpBin = defined('PHP_BINARY') && PHP_BINARY !== '' ? PHP_BINARY : 'php';
+                        $output = [];
+                        $exitCode = 1;
+
+                        @exec(
+                            escapeshellarg($phpBin) . ' -l ' . escapeshellarg($lintTmp) . ' 2>&1',
+                            $output,
+                            $exitCode
+                        );
+
+                        @unlink($lintTmp);
+
+                        if ($exitCode !== 0) {
+                            $error = 'Update rejected: PHP syntax check failed. ' .
+                                trim(implode("\n", $output));
+                        } elseif (@file_put_contents($newTmp, $contents, LOCK_EX) === false) {
+                            $error = 'Could not prepare the new website file.';
+                        } else {
+                            $backupFile = $backupDir . DIRECTORY_SEPARATOR .
+                                'index_' . date('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '.php';
+
+                            if (!@copy(__FILE__, $backupFile)) {
+                                @unlink($newTmp);
+                                $error = 'Backup could not be created. Update cancelled.';
+                            } elseif (!@rename($newTmp, __DIR__ . DIRECTORY_SEPARATOR . 'index.php')) {
+                                @unlink($newTmp);
+                                $error = 'Could not activate the new website file.';
+                            } else {
+                                set_setting('last_update_backup', basename($backupFile));
+                                set_setting('last_update_at', date('Y-m-d H:i:s'));
+                                log_event((int)$me['id'], null, 'WEBSITE_UPDATE');
+                                redirect_to('?page=admin&tab=website&updated=1');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (isset($_POST['action']) && $_POST['action'] === 'website_update_rollback') {
+        check_csrf();
+
+        $backupDir = __DIR__ . DIRECTORY_SEPARATOR . 'backups';
+        $backupName = get_setting('last_update_backup');
+        $backupFile = $backupDir . DIRECTORY_SEPARATOR . basename($backupName);
+
+        if (
+            $backupName === '' ||
+            !is_file($backupFile)
+        ) {
+            $error = 'No valid website backup was found.';
+        } else {
+            $restoreTmp = $backupDir . DIRECTORY_SEPARATOR . '.rollback_' . bin2hex(random_bytes(8)) . '.php';
+            $contents = @file_get_contents($backupFile);
+
+            if ($contents === false || !preg_match('/^\s*<\?php\b/i', $contents)) {
+                $error = 'Backup file is invalid.';
+            } elseif (@file_put_contents($restoreTmp, $contents, LOCK_EX) === false) {
+                $error = 'Could not prepare rollback.';
+            } else {
+                $phpBin = defined('PHP_BINARY') && PHP_BINARY !== '' ? PHP_BINARY : 'php';
+                $output = [];
+                $exitCode = 1;
+
+                @exec(
+                    escapeshellarg($phpBin) . ' -l ' . escapeshellarg($restoreTmp) . ' 2>&1',
+                    $output,
+                    $exitCode
+                );
+
+                if ($exitCode !== 0) {
+                    @unlink($restoreTmp);
+                    $error = 'Rollback rejected: backup syntax check failed.';
+                } elseif (!@rename($restoreTmp, __DIR__ . DIRECTORY_SEPARATOR . 'index.php')) {
+                    @unlink($restoreTmp);
+                    $error = 'Could not activate rollback.';
+                } else {
+                    log_event((int)$me['id'], null, 'WEBSITE_ROLLBACK');
+                    redirect_to('?page=admin&tab=website&rolled_back=1');
+                }
+            }
+        }
+    }
 
     if (isset($_POST['admin_toggle_user'])) {
         check_csrf();
@@ -526,7 +865,7 @@ if (is_admin()) {
    Maintenance mode
 ------------------------- */
 
-$maintenanceAdminAccess = isset($_GET['admin']) && (string)$_GET['admin'] === '1';
+$maintenanceAdminAccess = is_admin();
 
 if (get_setting('maintenance') === '1' && !is_admin() && !$maintenanceAdminAccess) {
 ?>
@@ -1644,6 +1983,7 @@ th{
         <a href="?page=admin&tab=overview">Overview</a>
         <a href="?page=admin&tab=users">Users</a>
         <a href="?page=admin&tab=keys">Keys</a>
+        <a href="?page=admin&tab=projects">Projects</a>
         <a href="?page=admin&tab=website">Website</a>
         <a href="?page=admin&tab=links">Links</a>
         <a href="?page=admin&tab=security">Security</a>
@@ -1869,6 +2209,89 @@ th{
             </div>
         </section>
 
+    <?php elseif ($tab === 'projects'): ?>
+
+        <?php
+        $projectSlots = project_stats_for_admin();
+        $slotOrder = [
+            'PythonDateBase','PHPDateBase','HTMLDateBase',
+            'PhoneLookupDateBase','DatabaseDateBase','CustomDateBase'
+        ];
+        ?>
+
+        <section class="card admin">
+            <h3>📊 Project Tracking DataBases</h3>
+            <p class="muted">
+                Data is grouped by the API key type. A Python key goes to
+                <b>PythonDateBase</b>, PHP to <b>PHPDateBase</b>, and so on.
+                Live users are users whose heartbeat was seen within the last 90 seconds.
+            </p>
+        </section>
+
+        <?php foreach ($slotOrder as $slotName): ?>
+            <?php
+            $slot = $projectSlots[$slotName] ?? [
+                'key_type' => '',
+                'projects' => [],
+                'requests' => 0,
+                'users' => []
+            ];
+            ?>
+            <section class="card admin">
+                <h3>🗃️ <?=e($slotName)?></h3>
+
+                <div class="stats">
+                    <div class="stat">
+                        <div class="statIcon">📁</div>
+                        <div class="statName">PROJECTS</div>
+                        <div class="statValue"><?=count($slot['projects'])?></div>
+                    </div>
+                    <div class="stat">
+                        <div class="statIcon">👥</div>
+                        <div class="statName">USERS</div>
+                        <div class="statValue"><?=count($slot['users'])?></div>
+                    </div>
+                    <div class="stat">
+                        <div class="statIcon">⚡</div>
+                        <div class="statName">REQUESTS</div>
+                        <div class="statValue"><?=number_format((int)$slot['requests'])?></div>
+                    </div>
+                </div>
+
+                <?php if (!$slot['projects']): ?>
+                    <div class="notice" style="margin-top:10px">
+                        No project has sent tracking data to this slot yet.
+                    </div>
+                <?php else: ?>
+                    <?php foreach ($slot['projects'] as $projectName => $project): ?>
+                        <div class="channel" style="margin-top:10px">
+                            <div>
+                                <b><?=e((string)$projectName)?></b>
+                                <div class="muted">
+                                    Type: <?=e((string)$project['project_type'])?> ·
+                                    Users: <?=count($project['users'])?> ·
+                                    Live: <?=e((string)$project['live_users'])?> ·
+                                    Requests: <?=number_format((int)$project['requests'])?>
+                                </div>
+                                <div class="muted">
+                                    Last seen: <?=e((string)($project['last_seen'] ?? 'Never'))?>
+                                </div>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </section>
+        <?php endforeach; ?>
+
+        <section class="card admin">
+            <h3>🔌 Heartbeat Endpoint</h3>
+            <p class="muted">
+                A client project should send a heartbeat with its API key,
+                project name, project type and a non-sensitive unique user ID.
+            </p>
+            <pre style="white-space:pre-wrap;word-break:break-word">/?api=1&amp;action=heartbeat&amp;key=YOUR_KEY&amp;project=MyWebsite&amp;project_type=website&amp;user=USER_ID</pre>
+        </section>
+
     <?php elseif ($tab === 'website'): ?>
 
         <section class="card admin">
@@ -1899,6 +2322,16 @@ th{
             </form>
         </section>
 
+        <?php if (isset($_GET['updated'])): ?>
+            <div class="notice" style="margin-bottom:10px">
+                ✅ Website update installed successfully.
+            </div>
+        <?php elseif (isset($_GET['rolled_back'])): ?>
+            <div class="notice" style="margin-bottom:10px">
+                ↩️ Latest website backup restored successfully.
+            </div>
+        <?php endif; ?>
+
         <section class="card admin" id="website-updater-card">
             <h3>🚀 Website Updater</h3>
             <p class="muted">
@@ -1907,6 +2340,7 @@ th{
             </p>
 
             <form method="post" enctype="multipart/form-data" style="margin-top:12px">
+                <input type="hidden" name="csrf" value="<?=e(csrf())?>">
                 <input type="hidden" name="action" value="website_update_upload">
 
                 <label>New Website PHP File</label>
@@ -1926,9 +2360,17 @@ th{
                 <b>Safety:</b> the file is syntax-checked before activation.
                 The current website is backed up first.
             </div>
+            <div class="muted" style="margin-top:8px">
+                Last update:
+                <?=e(get_setting('last_update_at') ?: 'Never')?>
+                <?php if (get_setting('last_update_backup') !== ''): ?>
+                    · Backup: <?=e(get_setting('last_update_backup'))?>
+                <?php endif; ?>
+            </div>
 
             <form method="post" style="margin-top:10px"
                   onsubmit="return confirm('Rollback to the latest website backup?');">
+                <input type="hidden" name="csrf" value="<?=e(csrf())?>">
                 <input type="hidden" name="action" value="website_update_rollback">
                 <button class="btn gray" type="submit">
                     ↩️ Rollback Latest Backup
@@ -1936,7 +2378,7 @@ th{
             </form>
         </section>
 
-elseif ($tab === 'links'): ?>
+    <?php elseif ($tab === 'links'): ?>
 
         <section class="card admin">
             <h3>🔗 Footer / Channel Links</h3>
